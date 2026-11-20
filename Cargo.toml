@@ -1,0 +1,58 @@
+[package]
+name = "airpods"
+version = "0.1.0"
+edition = "2021"
+description = "AirPods daemon for Linux"
+license = "MIT"
+
+[[bin]]
+name = "airpods"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# D-Bus
+zbus = { version = "4", features = ["tokio"] }
+zvariant = "4"
+
+# Bluetooth
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Async channels
+async-broadcast = "0.7"
+futures = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto (for AirPods protocol)
+aes = "0.8"
+ctr = "0.9"
+
+# Hex utilities
+hex = "0.4"
+
+# Low-level Bluetooth for SDP
+libc = "0.2"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

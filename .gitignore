@@ -1,3 +1,9 @@
 build/
 CMakeFiles/
 CMakeCache.txt
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
