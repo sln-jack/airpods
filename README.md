@@ -57,6 +57,28 @@ cp airpods.service ~/.config/systemd/user/
 systemctl --user enable --now airpods
 ```
 
+### WirePlumber
+
+The daemon provides the AirPods' sink and source itself, so WirePlumber's
+Bluetooth monitor has to be off. Left on, it adds a second, HFP-only "AirPods"
+sink and source, and takes the playback stream on connect, which the daemon
+can only win back by reconnecting the AirPods.
+
+WirePlumber 0.4, in `~/.config/wireplumber/bluetooth.lua.d/51-no-bluez.lua`:
+
+```lua
+bluez_monitor.enabled = false
+```
+
+WirePlumber 0.5+, in `~/.config/wireplumber/wireplumber.conf.d/51-no-bluez.conf`:
+
+```
+wireplumber.profiles = { main = { monitor.bluez = disabled } }
+```
+
+Then `systemctl --user restart wireplumber`. Other Bluetooth audio devices
+stop appearing in PipeWire.
+
 ## Usage
 
 ### Run the daemon

@@ -503,9 +503,12 @@ async fn follow(state: Arc<DaemonState>, session: Session, adapter: bluer::Adapt
 async fn connect_paired(adapter: &bluer::Adapter) -> Result<()> {
     let mut connected = Err(anyhow::anyhow!("no paired AirPods"));
     for airpods in bluez::find_paired_airpods(adapter).await? {
-        connected = bluez::connect_device(&adapter.device(airpods.address)?).await;
-        if connected.is_ok() {
-            break;
+        let device = adapter.device(airpods.address)?;
+        connected = bluez::connect_device(&device).await;
+        // BlueZ also fails the call when the daemon sets up the playback
+        // stream before BlueZ's own attempt at it.
+        if connected.is_ok() || device.is_connected().await.unwrap_or(false) {
+            return Ok(());
         }
     }
     connected
