@@ -2,7 +2,7 @@ use airpods::audio::{self, eld::{EldDecoder, TS_PER_FRAME}, mic::VirtualMic};
 use airpods::bluez;
 use airpods::dbus_service::{self, Callbacks};
 use airpods::l2cap;
-use airpods::protocol::{commands, parse, packets};
+use airpods::protocol::{arbitration, commands, parse, packets};
 use airpods::types::{DeviceState, NoiseControlMode};
 use anyhow::Result;
 use bluer::{Address, Session};
@@ -94,6 +94,14 @@ async fn handle_packet(state: &DaemonState, data: &[u8]) {
     let packet_type = parse::identify_packet(data);
     tracing::debug!("<- {:?} {}", packet_type, hex::encode(data));
 
+    if packet_type == parse::PacketType::Arbitration {
+        match arbitration::decode(data) {
+            Ok(event) => info!("Arbitration {event}"),
+            Err(reason) => warn!("Arbitration decode failed for opcode {:#04x} ({} bytes): {reason}", data[4], data.len()),
+        }
+        return;
+    }
+
     let mut conn_state = state.connection_state.write().await;
     let mut device_state = state.device_state.write().await;
 
@@ -116,6 +124,10 @@ async fn handle_packet(state: &DaemonState, data: &[u8]) {
                 info!("Features acknowledged, requesting notifications");
                 if let Some(ref mut conn) = *state.l2cap_connection.write().await {
                     let _ = send_packet(conn, &packets::connection::REQUEST_NOTIFICATIONS).await;
+                    match send_packet(conn, &packets::connection::GET_TIPI_TABLE).await {
+                        Ok(()) => info!("Arbitration requested device table"),
+                        Err(e) => warn!("Arbitration table request failed: {e}"),
+                    }
                 }
                 *conn_state = ConnectionState::Connected;
                 device_state.connected = true;
@@ -377,6 +389,17 @@ async fn run_daemon() -> Result<()> {
     // Initialize BlueZ session
     let session = Session::new().await?;
     let adapter = bluez::get_default_adapter(&session).await?;
+
+    if let Ok(address) = adapter.address().await {
+        info!("Arbitration local adapter {} address={address}", adapter.name());
+    }
+
+    match adapter.modalias().await {
+        Ok(Some(id)) => info!("Arbitration local Device ID source={} vendor={:#06x} product={:#06x}",
+                              id.source, id.vendor, id.product),
+        Ok(None) => info!("Arbitration local Device ID unavailable"),
+        Err(e) => warn!("Arbitration could not read local Device ID: {e}"),
+    }
 
     match bluez::a2dp::A2dp::register(adapter.name()).await {
         Ok(a2dp) => drop(state.a2dp.set(a2dp)),

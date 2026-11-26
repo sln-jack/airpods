@@ -1,3 +1,4 @@
+pub mod arbitration;
 pub mod commands;
 pub mod packets;
 pub mod parse;

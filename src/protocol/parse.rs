@@ -7,6 +7,7 @@ use crate::types::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     Unknown,
+    Arbitration,
     HandshakeAck,
     FeaturesAck,
     Battery,
@@ -51,6 +52,9 @@ pub fn identify_packet(data: &[u8]) -> PacketType {
         return PacketType::OneBudAnc;
     }
 
+    if matches!(data, [4, 0, 4, 0, 0x10 | 0x11 | 0x2e, 0, ..] | [4, 0, 4, 0, 9, 0, 6, ..]) {
+        return PacketType::Arbitration;
+    }
     PacketType::Unknown
 }
 

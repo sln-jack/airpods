@@ -102,6 +102,17 @@ airpods up      # Connect the paired AirPods
 airpods down    # Disconnect them
 ```
 
+### Capture an automatic switching diagnostic
+
+Disconnect the AirPods from the Mac and play audio on the iPhone. From the Linux checkout run:
+
+```bash
+cargo build --release
+./scripts/test-arbitration.sh
+```
+
+The helper runs the local build, calls `airpods up` once, and saves the device table, ownership reports, and relays in the log path it prints. If phone audio stops, tap Play on the phone once during the 30-second observation window. The helper temporarily stops an active user `airpods.service` and restores it on exit.
+
 ### Pair AirPods
 
 Put your AirPods in pairing mode (case lid open, hold button until light flashes white), then:

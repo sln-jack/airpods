@@ -37,6 +37,8 @@ pub mod connection {
     // Request notifications: 04 00 04 00 0f 00 ff ff ff ff ff
     pub const REQUEST_NOTIFICATIONS: [u8; 11] = hex!("040004000f00ffffffffff");
 
+    pub const GET_TIPI_TABLE: [u8; 6] = hex!("040004002d00");
+
     // AirPods disconnected indicator
     pub const DISCONNECTED: [u8; 4] = hex!("00010000");
 }
