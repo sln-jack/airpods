@@ -1,4 +1,5 @@
 pub mod a2dp;
+pub mod multipoint;
 
 use anyhow::{Context, Result};
 use bluer::Address;

@@ -15,6 +15,7 @@ cleanup() {
         wait "$pid" || true
     fi
     if [[ $restore == yes ]]; then systemctl --user start airpods.service; fi
+    echo "Saved diagnostic log: $log"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -27,7 +28,7 @@ if busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop
     echo "An independently launched AirPods daemon is running. Stop that copy and rerun." >&2
     exit 1
 fi
-RUST_LOG=info "$bin" daemon >>"$log" 2>&1 &
+RUST_LOG=info "$bin" daemon --multipoint >>"$log" 2>&1 &
 pid=$!
 for ((i=0; i<100; i++)); do
     grep -q 'Daemon ready' "$log" && break
@@ -38,5 +39,5 @@ if ! grep -q 'Daemon ready' "$log"; then tail -12 "$log"; exit 1; fi
 printf 'Linux Connect requested %s\n' "$(date -u +%FT%TZ)" >>"$log"
 echo 'Connecting Linux once. Leave Linux audio paused. If iPhone playback stops, tap Play there once.'
 timeout 20 "$bin" up >>"$log" 2>&1 || true
-sleep 30
-grep -E 'Arbitration|Reconnecting the AirPods|L2CAP connection attempt|Handshake|Features acknowledged' "$log" || true
+echo 'Linux stays connected while you try the iPhone output picker. Press Ctrl-C here when finished.'
+wait "$pid"

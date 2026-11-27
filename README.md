@@ -102,6 +102,12 @@ airpods up      # Connect the paired AirPods
 airpods down    # Disconnect them
 ```
 
+### Multipoint
+
+Run `airpods daemon --multipoint` to publish an additional Apple PnP Device ID through BlueZ while the daemon runs. Other Bluetooth peers querying the adapter can also see this record. Start the daemon before connecting the AirPods.
+
+When the AirPods report two fully connected hosts, including this adapter, the daemon sends the AACP connection priority list (0x14) if either host lacks the listed bit. It puts the last-playing host first when the table identifies one, otherwise keeping table order. This follows the recorded Mac transition. Look for `Multipoint SDP identity registered`, `Arbitration sent priority list`, and a subsequent table with `listed=true` for both hosts. This mode handles link retention; playback takeover is a separate operation.
+
 ### Capture an automatic switching diagnostic
 
 Disconnect the AirPods from the Mac and play audio on the iPhone. From the Linux checkout run:
@@ -111,7 +117,7 @@ cargo build --release
 ./scripts/test-arbitration.sh
 ```
 
-The helper runs the local build, calls `airpods up` once, and saves the device table, ownership reports, and relays in the log path it prints. If phone audio stops, tap Play on the phone once during the 30-second observation window. The helper temporarily stops an active user `airpods.service` and restores it on exit.
+The helper runs the local build with `--multipoint`, calls `airpods up` once, and saves the device table, ownership reports, and relays in the log path it prints. If phone audio stops, tap Play on the phone once. You can then try selecting the AirPods in the iPhone output picker. Press Ctrl-C on Linux when finished. The helper temporarily stops an active user `airpods.service` and restores it on exit.
 
 ### Pair AirPods
 

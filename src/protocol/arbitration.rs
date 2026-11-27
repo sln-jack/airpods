@@ -1,11 +1,59 @@
-//! Read-only diagnostics for AACP audio ownership and host-to-host relays.
-use std::{collections::BTreeMap, fmt};
+//! AACP audio ownership, host tables, priority lists and relays.
+use bluer::Address;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, PartialEq)]
 pub struct Host {
     pub address: String,
     pub state: u8,
     pub flags: u8,
+}
+
+/// Pending write on this AACP session. A table with bit 0 set for both hosts
+/// confirms the list. A later loss of that bit can then trigger a fresh write.
+#[derive(Default)]
+pub struct PriorityList {
+    pending: Option<([u8; 19], Instant)>,
+}
+
+impl PriorityList {
+    pub fn update(&mut self, local: Address, hosts: &[Host], now: Instant) -> Option<[u8; 19]> {
+        let [first, second] = hosts else {
+            self.pending = None;
+            return None;
+        };
+        if first.state != 2 || second.state != 2 || (first.flags & second.flags & 1) != 0 {
+            self.pending = None;
+            return None;
+        }
+        let mut a: Address = first.address.parse().ok()?;
+        let mut b: Address = second.address.parse().ok()?;
+        if a == b || (local != a && local != b) {
+            return None;
+        }
+        // Mac frame 1983 put the last-playing iPhone first, despite the Mac
+        // owning audio. Preserve table order when last-play is ambiguous.
+        if first.flags & 4 == 0 && second.flags & 4 != 0 {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let mut packet = [0u8; 19];
+        packet[..7].copy_from_slice(&[4, 0, 4, 0, 0x14, 0, 2]);
+        a.0.reverse();
+        b.0.reverse();
+        packet[7..13].copy_from_slice(&a.0);
+        packet[13..].copy_from_slice(&b.0);
+        if let Some((last, sent)) = self.pending {
+            if last == packet && now.duration_since(sent) < Duration::from_secs(2) {
+                return None;
+            }
+        }
+        self.pending = Some((packet, now));
+        Some(packet)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -170,13 +218,14 @@ impl fmt::Display for Event<'_> {
                     };
                     write!(
                         f,
-                        " [{} {}({}) owner={} last_play={} flags={:#04x}]",
+                        " [{} {}({}) owner={} last_play={} flags={:#04x} listed={}]",
                         host.address,
                         state,
                         host.state,
                         host.flags & 2 != 0,
                         host.flags & 4 != 0,
-                        host.flags
+                        host.flags,
+                        host.flags & 1 != 0
                     )?;
                 }
                 Ok(())
@@ -208,6 +257,39 @@ mod tests {
         assert!(display.contains("0A:0B:0C:0D:0E:0F connected(2) owner=false last_play=true"));
         data.pop();
         assert!(decode(&data).is_err());
+    }
+
+    #[test]
+    fn priority_follows_two_connected_hosts_and_list_confirmation() {
+        let local = Address([10, 11, 12, 13, 14, 15]);
+        let mut hosts = vec![
+            Host {
+                address: local.to_string(),
+                state: 2,
+                flags: 0x12,
+            },
+            Host {
+                address: "01:02:03:04:05:06".into(),
+                state: 1,
+                flags: 4,
+            },
+        ];
+        let mut list = PriorityList::default();
+        let now = Instant::now();
+        assert_eq!(list.update(local, &hosts, now), None);
+        hosts[1].state = 2;
+        let packet = [
+            4, 0, 4, 0, 0x14, 0, 2, 6, 5, 4, 3, 2, 1, 15, 14, 13, 12, 11, 10,
+        ];
+        assert_eq!(list.update(local, &hosts, now), Some(packet));
+        assert_eq!(list.update(local, &hosts, now), None);
+        for host in &mut hosts {
+            host.flags |= 1;
+        }
+        assert_eq!(list.update(local, &hosts, now), None);
+        hosts[0].flags &= !1;
+        assert_eq!(list.update(local, &hosts, now), Some(packet));
+        assert_eq!(list.update(Address([0; 6]), &hosts, now), None);
     }
 
     #[test]

@@ -31,7 +31,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the AirPods daemon
-    Daemon,
+    Daemon {
+        /// Advertise a session-scoped Apple Device ID and maintain AirPods host priority.
+        #[arg(long)]
+        multipoint: bool,
+    },
     /// Start pairing mode
     Pair,
     /// Connect the paired AirPods
@@ -56,6 +60,7 @@ enum ConnectionState {
 
 // Daemon state
 struct DaemonState {
+    multipoint_address: Option<Address>,
     device_state: Arc<RwLock<DeviceState>>,
     connection_state: Arc<RwLock<ConnectionState>>,
     l2cap_connection: Arc<RwLock<Option<l2cap::Connection>>>,
@@ -68,9 +73,10 @@ struct DaemonState {
 }
 
 impl DaemonState {
-    fn new() -> Self {
+    fn new(multipoint_address: Option<Address>) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         Self {
+            multipoint_address,
             device_state: Arc::new(RwLock::new(DeviceState::default())),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             l2cap_connection: Arc::new(RwLock::new(None)),
@@ -90,14 +96,28 @@ async fn send_packet(connection: &mut l2cap::Connection, packet: &[u8]) -> Resul
     Ok(())
 }
 
-async fn handle_packet(state: &DaemonState, data: &[u8]) {
+async fn handle_packet(state: &DaemonState, priority: &mut arbitration::PriorityList, data: &[u8]) {
     let packet_type = parse::identify_packet(data);
     tracing::debug!("<- {:?} {}", packet_type, hex::encode(data));
 
     if packet_type == parse::PacketType::Arbitration {
-        match arbitration::decode(data) {
-            Ok(event) => info!("Arbitration {event}"),
-            Err(reason) => warn!("Arbitration decode failed for opcode {:#04x} ({} bytes): {reason}", data[4], data.len()),
+        let event = match arbitration::decode(data) {
+            Ok(event) => event,
+            Err(reason) => {
+                warn!("Arbitration decode failed for opcode {:#04x} ({} bytes): {reason}", data[4], data.len());
+                return;
+            }
+        };
+        info!("Arbitration {event}");
+        let (Some(local), arbitration::Event::Table { hosts, .. }) = (state.multipoint_address, event) else {
+            return;
+        };
+        let Some(packet) = priority.update(local, &hosts, Instant::now()) else { return };
+        if let Some(conn) = state.l2cap_connection.write().await.as_mut() {
+            match conn.send(&packet).await {
+                Ok(()) => info!("Arbitration sent priority list {}", hex::encode(packet)),
+                Err(e) => warn!("Arbitration priority list failed: {e}"),
+            }
         }
         return;
     }
@@ -276,6 +296,7 @@ async fn recv_loop(state: &DaemonState, fd: RawFd) -> Result<()> {
     let mut buf = vec![0u8; 4096];
     let mut pcm = Vec::new();
     let mut next_ts: Option<u32> = None;
+    let mut priority = arbitration::PriorityList::default();
     loop {
         let mut ready = afd.readable().await?;
         let n = match ready.try_io(|_| {
@@ -293,7 +314,7 @@ async fn recv_loop(state: &DaemonState, fd: RawFd) -> Result<()> {
             if audio::is_reply(data) {
                 state.mic_reply.notify_one();
             }
-            handle_packet(state, data).await;
+            handle_packet(state, &mut priority, data).await;
             continue;
         }
         *state.last_audio.lock().unwrap() = Instant::now();
@@ -381,18 +402,28 @@ async fn set_noise_control(state: &DaemonState, mode: NoiseControlMode) -> Resul
     Ok(())
 }
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(multipoint: bool) -> Result<()> {
     info!("AirPods daemon starting...");
-
-    let state = Arc::new(DaemonState::new());
 
     // Initialize BlueZ session
     let session = Session::new().await?;
     let adapter = bluez::get_default_adapter(&session).await?;
 
-    if let Ok(address) = adapter.address().await {
+    let local_address = adapter.address().await;
+    if let Ok(address) = &local_address {
         info!("Arbitration local adapter {} address={address}", adapter.name());
     }
+
+    let mut identity = None;
+    let multipoint_address = if multipoint {
+        let local = local_address?;
+        identity = Some(bluez::multipoint::register(&session).await?);
+        info!("Multipoint SDP identity registered");
+        Some(local)
+    } else {
+        None
+    };
+    let state = Arc::new(DaemonState::new(multipoint_address));
 
     match adapter.modalias().await {
         Ok(Some(id)) => info!("Arbitration local Device ID source={} vendor={:#06x} product={:#06x}",
@@ -470,10 +501,16 @@ async fn run_daemon() -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut shutdown_rx = state.shutdown_tx.subscribe();
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
-        _ = shutdown_rx.recv() => {}
+    loop {
+        tokio::select! {
+            Some(Some(request)) = OptionFuture::from(identity.as_mut().map(|profile| profile.next())) => {
+                // Device ID is an SDP record with no data channel.
+                request.reject(bluer::rfcomm::ReqError::Rejected);
+            }
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
+            _ = shutdown_rx.recv() => break,
+        }
     }
     // BlueZ doesn't close the stream of an endpoint that just goes away, and
     // the AirPods then refuse a new one until they reconnect.
@@ -667,7 +704,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon => run_daemon().await,
+        Commands::Daemon { multipoint } => run_daemon(multipoint).await,
         Commands::Pair => cmd_pair().await,
         Commands::Up => connect_paired(&default_adapter().await?).await,
         Commands::Down => disconnect_connected(&default_adapter().await?).await,
