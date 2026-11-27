@@ -1,9 +1,9 @@
 //! Virtual PipeWire sink that plays to the AirPods. PCM is encoded to AAC-ELD
 //! and written to the A2DP transport, three frames per packet.
 //!
-//! The sink drives its own graph, one packet per cycle, and only while it has
-//! a transport: the transport is acquired when playback starts, and until
-//! then playback waits instead of losing its beginning.
+//! The sink drives its graph one packet per cycle during playback. Multipoint
+//! also samples the idle graph. A client feeding digital silence leaves the
+//! Bluetooth media transport idle.
 //!
 //! Volume is the AirPods' own: changes made in PipeWire are forwarded to the
 //! device rather than applied to the samples, and changes made on the device
@@ -26,7 +26,7 @@ const PACKET_PCM: usize = FRAME_PCM * FRAMES_PER_PACKET;
 const RTP_HEADER: usize = 12;
 const RTP_PAYLOAD_TYPE: u8 = 96;
 const PACKET_SAMPLES: u32 = (FRAMES_PER_PACKET * FRAME_SAMPLES) as u32;
-/// How often [`Sink::cycle`] must be called while there is a transport.
+/// Playback and idle sampling use one graph cycle per packet interval.
 pub const CYCLE: Duration = Duration::from_millis((PACKET_SAMPLES * 1000 / PLAY_RATE) as u64);
 /// Per-frame header: 0xB, 12-bit sequence, 0x1, 12-bit length.
 const FRAME_HEADER: usize = 4;
@@ -50,12 +50,18 @@ struct Tx {
 struct Out {
     tx: Option<Tx>,
     pcm: Vec<i16>,
+    probe: bool,
 }
 
 impl Out {
-    fn push(&mut self, pcm: &[i16]) {
+    /// Returns true once, when the first non-silent buffer needs a transport.
+    fn push(&mut self, pcm: &[i16]) -> bool {
         let Some(tx) = self.tx.as_mut() else {
-            return;
+            if self.probe && self.pcm.is_empty() && pcm.iter().any(|&sample| sample != 0) {
+                self.pcm.extend_from_slice(pcm);
+                return true;
+            }
+            return false;
         };
         self.pcm.extend_from_slice(pcm);
         let mut used = 0;
@@ -64,6 +70,7 @@ impl Out {
             used += PACKET_PCM;
         }
         self.pcm.drain(..used);
+        false
     }
 }
 
@@ -136,10 +143,14 @@ unsafe impl Sync for Sink {}
 impl Sink {
     /// The receiver yields device volumes (0..=127) requested through PipeWire.
     pub fn new() -> Option<(Self, watch::Receiver<u16>)> {
+        Self::with_silence_probe(false)
+    }
+
+    pub(crate) fn with_silence_probe(probe: bool) -> Option<(Self, watch::Receiver<u16>)> {
         let (volume_tx, volume_rx) = watch::channel(0);
         let mut shared = Box::new(Shared {
             stream: std::ptr::null_mut(),
-            out: Mutex::new(Out { tx: None, pcm: Vec::with_capacity(2 * PACKET_PCM), }),
+            out: Mutex::new(Out { tx: None, pcm: Vec::with_capacity(2 * PACKET_PCM), probe }),
             streaming: AtomicBool::new(false),
             changed: Arc::new(Notify::new()),
             volume: AtomicI32::new(-1),
@@ -162,12 +173,16 @@ impl Sink {
         }
     }
 
-    /// True while some app is playing to the sink.
+    /// The graph can be running even if every PCM sample is zero.
     pub fn streaming(&self) -> bool {
         self.shared.streaming.load(Ordering::Relaxed)
     }
 
-    /// Notified whenever playback starts or stops.
+    pub fn has_buffered_audio(&self) -> bool {
+        !self.shared.out.lock().unwrap().pcm.is_empty()
+    }
+
+    /// Notified on graph changes and the first non-silent buffer.
     pub fn changed(&self) -> Arc<Notify> {
         self.shared.changed.clone()
     }
@@ -179,7 +194,9 @@ impl Sink {
             return false;
         };
         let tx = Tx { fd, enc, packet: vec![0; mtu], frame_seq: 0, rtp_seq: 0, rtp_ts: 0 };
-        self.shared.out.lock().unwrap().tx = Some(tx);
+        let mut out = self.shared.out.lock().unwrap();
+        out.tx = Some(tx);
+        out.push(&[]); // Send the buffered onset before asking PipeWire for more.
         true
     }
 
@@ -189,7 +206,7 @@ impl Sink {
         out.pcm.clear();
     }
 
-    /// Run one graph cycle, which sends one packet.
+    /// Run one graph cycle to sample PCM or feed an acquired transport.
     pub fn cycle(&self) {
         self.stream.locked(|| unsafe { pw::pw_stream_trigger_process(self.stream.ptr) });
     }
@@ -306,9 +323,24 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         let chunk = &*d.chunk;
         let offset = chunk.offset.min(d.maxsize);
         let size = chunk.size.min(d.maxsize - offset);
-        let pcm = std::slice::from_raw_parts(d.data.add(offset as usize) as *const i16, size as usize / 2);
+        let samples = size as usize / 2;
         if let Ok(mut out) = shared.out.try_lock() {
-            out.push(pcm);
+            // An EMPTY chunk represents silence even if its buffer contains
+            // samples from a previous cycle.
+            if chunk.flags & pw::CHUNK_FLAG_EMPTY != 0 {
+                if out.tx.is_some() {
+                    const ZERO: [i16; PACKET_PCM] = [0; PACKET_PCM];
+                    for _ in 0..samples / PACKET_PCM {
+                        out.push(&ZERO);
+                    }
+                    out.push(&ZERO[..samples % PACKET_PCM]);
+                }
+            } else {
+                let pcm = std::slice::from_raw_parts(d.data.add(offset as usize) as *const i16, samples);
+                if out.push(pcm) {
+                    shared.changed.notify_one();
+                }
+            }
         }
     }
     pw::pw_stream_queue_buffer(shared.stream, b);
@@ -318,6 +350,20 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn multipoint_waits_for_actual_samples_and_keeps_the_onset() {
+        let mut out = Out { tx: None, pcm: Vec::new(), probe: true };
+        let silence = [0; PACKET_PCM];
+        for _ in 0..730 {
+            assert!(!out.push(&silence));
+        }
+        assert!(out.pcm.is_empty());
+        let onset = [0, 0, 0, -1];
+        assert!(out.push(&onset));
+        assert!(!out.push(&silence));
+        assert_eq!(out.pcm, onset);
+    }
 
     #[test]
     fn packets_fit_the_mtu_and_carry_three_frames() {
@@ -333,7 +379,7 @@ mod tests {
             rtp_seq: 7,
             rtp_ts: 0,
         };
-        let mut out = Out { tx: None, pcm: Vec::new() };
+        let mut out = Out { tx: None, pcm: Vec::new(), probe: false };
         // 2.5 packets' worth of noise, the hardest input to fit.
         let mut x = 1u32;
         let noise: Vec<i16> = (0..PACKET_PCM * 5 / 2)

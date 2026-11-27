@@ -45,6 +45,7 @@ trait MediaTransport {
 
 #[derive(Default)]
 struct Shared {
+    multipoint: bool,
     playing: Mutex<Option<JoinHandle<()>>>,
     /// Whether BlueZ has a stream configured on the endpoint.
     configured: watch::Sender<bool>,
@@ -108,7 +109,7 @@ impl Endpoint {
 /// stop playing a stream that pauses, until it is suspended and started again.
 async fn play(conn: Connection, path: OwnedObjectPath, shared: &Shared) -> Result<()> {
     let transport = MediaTransportProxy::builder(&conn).path(path)?.build().await?;
-    let (sink, mut requested) = Sink::new().context("creating the sink")?;
+    let (sink, mut requested) = Sink::with_silence_probe(shared.multipoint).context("creating the sink")?;
     tracing::info!("AirPods playback ready (AAC-ELD)");
 
     let wake = sink.changed();
@@ -126,23 +127,31 @@ async fn play(conn: Connection, path: OwnedObjectPath, shared: &Shared) -> Resul
     loop {
         // Announce the acquisition before checking for a suspension request,
         // so that `A2dp::suspend` can't miss one in progress.
-        if sink.streaming() {
+        let streaming = sink.streaming();
+        let demand = streaming && (!shared.multipoint || acquired || sink.has_buffered_audio());
+        if demand {
             shared.held.send_replace(true);
         }
-        let want = sink.streaming() && !*suspend.borrow_and_update();
+        let suspended = *suspend.borrow_and_update();
+        let want = demand && !suspended;
         if want && !acquired {
             match transport.acquire().await {
                 Ok((fd, _, mtu)) => {
                     acquired = sink.set_transport(fd.into(), mtu as usize);
+                    if !acquired {
+                        let _ = transport.release().await;
+                        anyhow::bail!("cannot encode for the acquired transport MTU {mtu}");
+                    }
                     tracing::debug!("transport acquired");
                 }
                 Err(e) => {
                     tracing::warn!("acquiring the transport: {}", e);
+                    shared.held.send_replace(false);
                     tokio::time::sleep(RETRY).await;
                     continue;
                 }
             }
-        } else if !want {
+        } else if !streaming || suspended {
             sink.clear_transport();
             if acquired {
                 tracing::debug!("releasing the transport");
@@ -155,7 +164,7 @@ async fn play(conn: Connection, path: OwnedObjectPath, shared: &Shared) -> Resul
         shared.held.send_replace(acquired);
 
         tokio::select! {
-            _ = cycle.tick(), if acquired => sink.cycle(),
+            _ = cycle.tick(), if acquired || (shared.multipoint && streaming && !suspended) => sink.cycle(),
             _ = wake.notified() => {}
             _ = suspend.changed() => {}
             Some(change) = state.next() => match change.get().await.as_deref() {
@@ -217,8 +226,12 @@ impl A2dp {
     /// Register the AAC-ELD endpoint on `adapter` (e.g. "hci0"), and again
     /// whenever BlueZ restarts.
     pub async fn register(adapter: &str) -> Result<Self> {
+        Self::register_with_multipoint(adapter, false).await
+    }
+
+    pub async fn register_with_multipoint(adapter: &str, multipoint: bool) -> Result<Self> {
         let conn = Connection::system().await?;
-        let shared = Arc::<Shared>::default();
+        let shared = Arc::new(Shared { multipoint, ..Shared::default() });
         conn.object_server()
             .at(ENDPOINT, Endpoint { conn: conn.clone(), shared: shared.clone() })
             .await?;
@@ -254,6 +267,11 @@ impl A2dp {
     pub async fn suspend(&self) {
         self.shared.suspend.send_replace(true);
         let _ = self.shared.held.subscribe().wait_for(|held| !held).await;
+    }
+
+    /// Includes acquisition in progress and a microphone transition.
+    pub fn busy(&self) -> bool {
+        *self.shared.held.borrow() || *self.shared.suspend.borrow()
     }
 
     pub fn resume(&self) {

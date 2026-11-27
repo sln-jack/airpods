@@ -39,6 +39,9 @@ pub mod connection {
 
     pub const GET_TIPI_TABLE: [u8; 6] = hex!("040004002d00");
 
+    // Mac #1726, logged as Smart Routing enabled, desktop, score High.
+    pub const ROUTING_DESKTOP_HIGH: [u8; 12] = hex!("040004004400040002000206");
+
     // AirPods disconnected indicator
     pub const DISCONNECTED: [u8; 4] = hex!("00010000");
 }

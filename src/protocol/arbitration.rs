@@ -62,6 +62,7 @@ pub enum Event<'a> {
         header: [u8; 2],
         hosts: Vec<Host>,
     },
+    AudioSource { host: Address, activity: u8 },
     Ownership(u32),
     Relay {
         peer: String,
@@ -138,6 +139,12 @@ fn scalar<'a>(input: &mut &'a [u8], refs: &mut Vec<Scalar<'a>>) -> Result<Scalar
 pub fn decode(data: &[u8]) -> Result<Event<'_>> {
     let mut body = data.get(6..).ok_or("missing AACP header")?;
     match data.get(..6) {
+        Some([4, 0, 4, 0, 0x0e, 0]) => {
+            let mut host: [u8; 6] = take(&mut body, 6)?.try_into().unwrap();
+            let &[activity] = body else { return Err("invalid audio source length") };
+            host.reverse();
+            Ok(Event::AudioSource { host: Address(host), activity })
+        }
         Some([4, 0, 4, 0, 0x2e, 0]) => {
             let header = take(&mut body, 2)?.try_into().unwrap();
             let count = usize::from(take(&mut body, 1)?[0]);
@@ -229,6 +236,10 @@ impl fmt::Display for Event<'_> {
                     )?;
                 }
                 Ok(())
+            }
+            Self::AudioSource { host, activity } => {
+                let name = match activity { 0 => "idle", 1 => "call", 2 => "media", _ => "unknown" };
+                write!(f, "audio source {host} {name}({activity})")
             }
             Self::Ownership(value) => write!(f, "local ownership value={value}"),
             Self::Relay {

@@ -104,9 +104,11 @@ airpods down    # Disconnect them
 
 ### Multipoint
 
-Run `airpods daemon --multipoint` to publish an additional Apple PnP Device ID through BlueZ while the daemon runs. Other Bluetooth peers querying the adapter can also see this record. Start the daemon before connecting the AirPods.
+Start `airpods daemon --multipoint` before connecting the AirPods. It uses a primary Apple Device ID if BlueZ already has one. Otherwise, it publishes a supplemental Apple Device ID visible to other Bluetooth peers for the life of the daemon.
 
-When the AirPods report two fully connected hosts, including this adapter, the daemon sends the AACP connection priority list (0x14) if either host lacks the listed bit. It puts the last-playing host first when the table identifies one, otherwise keeping table order. This follows the recorded Mac transition. Look for `Multipoint SDP identity registered`, `Arbitration sent priority list`, and a subsequent table with `listed=true` for both hosts. This mode handles link retention; playback takeover is a separate operation.
+The daemon sends the desktop smart-routing announcement seen on macOS and waits for non-silent PCM before starting playback. If Linux is the sole connected host with a bud worn and the buds report an idle audio source for six seconds, it can reconnect once per pair per daemon run. A peer joining, a reported audio source, local playback or recording can suppress the attempt.
+
+When both hosts reach state 2, the daemon sends the AACP priority list (`0x14`) if either entry lacks the listed bit. The last-playing host goes first when known. Look for `Arbitration sent priority list`, followed by a table showing `listed=true` for both devices. End-to-end playback takeover remains unverified. [Capture findings and frame numbers](docs/multipoint-captures.md)
 
 ### Capture an automatic switching diagnostic
 
@@ -117,7 +119,7 @@ cargo build --release
 ./scripts/test-arbitration.sh
 ```
 
-The helper runs the local build with `--multipoint`, calls `airpods up` once, and saves the device table, ownership reports, and relays in the log path it prints. If phone audio stops, tap Play on the phone once. You can then try selecting the AirPods in the iPhone output picker. Press Ctrl-C on Linux when finished. The helper temporarily stops an active user `airpods.service` and restores it on exit.
+The helper runs the local build with `--multipoint`, calls `airpods up` once, and saves the device table, ownership reports, and relays in the log path it prints. Leave playback and the iPhone output picker alone during initial admission and the guarded reconnect. The table records whether the iPhone joined on its own. Press Ctrl-C on Linux when finished. The helper temporarily stops an active user `airpods.service` and restores it on exit.
 
 ### Pair AirPods
 

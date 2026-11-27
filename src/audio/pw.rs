@@ -63,6 +63,8 @@ pub struct SpaData {
     pub chunk: *mut SpaChunk,
 }
 
+pub const CHUNK_FLAG_EMPTY: i32 = 1 << 1;
+
 #[repr(C)]
 pub struct SpaChunk {
     pub offset: u32,

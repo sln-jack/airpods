@@ -37,7 +37,7 @@ for ((i=0; i<100; i++)); do
 done
 if ! grep -q 'Daemon ready' "$log"; then tail -12 "$log"; exit 1; fi
 printf 'Linux Connect requested %s\n' "$(date -u +%FT%TZ)" >>"$log"
-echo 'Connecting Linux once. Leave Linux audio paused. If iPhone playback stops, tap Play there once.'
+echo 'Starting idle admission. Keep Linux audio paused and leave the iPhone controls alone during recovery.'
 timeout 20 "$bin" up >>"$log" 2>&1 || true
-echo 'Linux stays connected while you try the iPhone output picker. Press Ctrl-C here when finished.'
+echo 'The daemon stays up. The log records any reconnect, two-host tables and priority writes. Press Ctrl-C to finish.'
 wait "$pid"

@@ -9,6 +9,7 @@ use bluer::{Address, Session};
 use clap::{Parser, Subcommand};
 use futures::future::OptionFuture;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::str::FromStr;
@@ -32,7 +33,7 @@ struct Cli {
 enum Commands {
     /// Run the AirPods daemon
     Daemon {
-        /// Advertise a session-scoped Apple Device ID and maintain AirPods host priority.
+        /// Enable shared-link recovery, desktop routing announcements and host priority.
         #[arg(long)]
         multipoint: bool,
     },
@@ -96,7 +97,12 @@ async fn send_packet(connection: &mut l2cap::Connection, packet: &[u8]) -> Resul
     Ok(())
 }
 
-async fn handle_packet(state: &DaemonState, priority: &mut arbitration::PriorityList, data: &[u8]) {
+async fn handle_packet(
+    state: &DaemonState,
+    priority: &mut arbitration::PriorityList,
+    admission: &mut bluez::multipoint::Admission,
+    data: &[u8],
+) {
     let packet_type = parse::identify_packet(data);
     tracing::debug!("<- {:?} {}", packet_type, hex::encode(data));
 
@@ -109,9 +115,9 @@ async fn handle_packet(state: &DaemonState, priority: &mut arbitration::Priority
             }
         };
         info!("Arbitration {event}");
-        let (Some(local), arbitration::Event::Table { hosts, .. }) = (state.multipoint_address, event) else {
-            return;
-        };
+        let Some(local) = state.multipoint_address else { return };
+        admission.observe(local, &event);
+        let arbitration::Event::Table { hosts, .. } = event else { return };
         let Some(packet) = priority.update(local, &hosts, Instant::now()) else { return };
         if let Some(conn) = state.l2cap_connection.write().await.as_mut() {
             match conn.send(&packet).await {
@@ -148,6 +154,11 @@ async fn handle_packet(state: &DaemonState, priority: &mut arbitration::Priority
                         Ok(()) => info!("Arbitration requested device table"),
                         Err(e) => warn!("Arbitration table request failed: {e}"),
                     }
+                    if state.multipoint_address.is_some() {
+                        if let Err(e) = send_packet(conn, &packets::connection::ROUTING_DESKTOP_HIGH).await {
+                            warn!("Desktop smart-routing announcement failed: {e}");
+                        }
+                    }
                 }
                 *conn_state = ConnectionState::Connected;
                 device_state.connected = true;
@@ -174,6 +185,7 @@ async fn handle_packet(state: &DaemonState, priority: &mut arbitration::Priority
 
         parse::PacketType::EarDetection => {
             if let Some(ear) = parse::parse_ear_detection(data) {
+                admission.worn = ear.any_in_ear();
                 device_state.ear_detection = ear;
                 info!(
                     "Ear: primary={} secondary={}",
@@ -227,7 +239,13 @@ async fn connect_airpods(state: &DaemonState, session: &Session, mac_address: &s
     let mut playback = false;
     if let Some(a2dp) = state.a2dp.get() {
         let path = format!("/org/bluez/{}/dev_{}", adapter.name(), mac_address.replace(':', "_"));
-        let stream = if fresh { a2dp.select(&path).await } else { a2dp.configure(&path).await };
+        // Multipoint must not disconnect a peer or stop WirePlumber merely
+        // to make our codec win endpoint selection.
+        let stream = if fresh && state.multipoint_address.is_none() {
+            a2dp.select(&path).await
+        } else {
+            a2dp.configure(&path).await
+        };
         match stream {
             Ok(()) => playback = true,
             Err(e) => warn!("AAC-ELD playback unavailable: {:#}", e),
@@ -281,7 +299,12 @@ async fn disconnect_airpods(state: &DaemonState) {
     state.mic.lock().unwrap().take();
 }
 
-async fn recv_loop(state: &DaemonState, fd: RawFd) -> Result<()> {
+enum LinkEnd {
+    Closed,
+    Relink,
+}
+
+async fn recv_loop(state: &DaemonState, fd: RawFd, check_alone: bool) -> Result<LinkEnd> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -297,8 +320,23 @@ async fn recv_loop(state: &DaemonState, fd: RawFd) -> Result<()> {
     let mut pcm = Vec::new();
     let mut next_ts: Option<u32> = None;
     let mut priority = arbitration::PriorityList::default();
+    let mut admission = bluez::multipoint::Admission::default();
+    let mut check_alone = check_alone;
     loop {
-        let mut ready = afd.readable().await?;
+        let deadline = if check_alone { admission.deadline(Instant::now()) } else { None };
+        let mut ready = tokio::select! {
+            biased;
+            ready = afd.readable() => ready?,
+            Some(()) = OptionFuture::from(deadline.map(|at| tokio::time::sleep_until(at.into()))) => {
+                check_alone = false;
+                let recording = state.mic.lock().unwrap().as_ref().is_some_and(|mic| mic.streaming());
+                let busy = state.a2dp.get().is_none_or(|a2dp| a2dp.busy());
+                if admission.should_relink(recording || busy) {
+                    return Ok(LinkEnd::Relink);
+                }
+                continue;
+            }
+        };
         let n = match ready.try_io(|_| {
             let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
             if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
@@ -307,14 +345,14 @@ async fn recv_loop(state: &DaemonState, fd: RawFd) -> Result<()> {
             Err(_would_block) => continue,
         };
         if n == 0 {
-            return Ok(());
+            return Ok(LinkEnd::Closed);
         }
         let data = &buf[..n];
         if !audio::is_audio(data) {
             if audio::is_reply(data) {
                 state.mic_reply.notify_one();
             }
-            handle_packet(state, &mut priority, data).await;
+            handle_packet(state, &mut priority, &mut admission, data).await;
             continue;
         }
         *state.last_audio.lock().unwrap() = Instant::now();
@@ -414,25 +452,32 @@ async fn run_daemon(multipoint: bool) -> Result<()> {
         info!("Arbitration local adapter {} address={address}", adapter.name());
     }
 
+    let modalias = adapter.modalias().await;
+    let primary_is_apple = match &modalias {
+        Ok(Some(id)) => {
+            info!("Arbitration local Device ID source={} vendor={:#06x} product={:#06x}",
+                  id.source, id.vendor, id.product);
+            id.source == "bluetooth" && id.vendor == 0x004c
+        }
+        Ok(None) => { info!("Arbitration local Device ID unavailable"); false }
+        Err(e) => { warn!("Arbitration could not read local Device ID: {e}"); false }
+    };
     let mut identity = None;
     let multipoint_address = if multipoint {
         let local = local_address?;
-        identity = Some(bluez::multipoint::register(&session).await?);
-        info!("Multipoint SDP identity registered");
+        if primary_is_apple {
+            info!("Multipoint using BlueZ's primary Apple Device ID");
+        } else {
+            identity = Some(bluez::multipoint::register(&session).await?);
+            info!("Multipoint SDP identity registered as an additional Device ID");
+        }
         Some(local)
     } else {
         None
     };
     let state = Arc::new(DaemonState::new(multipoint_address));
 
-    match adapter.modalias().await {
-        Ok(Some(id)) => info!("Arbitration local Device ID source={} vendor={:#06x} product={:#06x}",
-                              id.source, id.vendor, id.product),
-        Ok(None) => info!("Arbitration local Device ID unavailable"),
-        Err(e) => warn!("Arbitration could not read local Device ID: {e}"),
-    }
-
-    match bluez::a2dp::A2dp::register(adapter.name()).await {
+    match bluez::a2dp::A2dp::register_with_multipoint(adapter.name(), multipoint).await {
         Ok(a2dp) => drop(state.a2dp.set(a2dp)),
         Err(e) => warn!("AAC-ELD playback unavailable: {:#}", e),
     }
@@ -529,6 +574,7 @@ async fn follow(state: Arc<DaemonState>, session: Session, adapter: bluer::Adapt
         Err(e) => return error!("Cannot watch for AirPods: {:#}", e),
     };
     let mut fresh = true;
+    let mut checked = HashSet::new();
     loop {
         let Ok(Some(airpods)) = bluez::find_connected_airpods(&adapter).await else {
             fresh = true;
@@ -538,16 +584,36 @@ async fn follow(state: Arc<DaemonState>, session: Session, adapter: bluer::Adapt
         info!("AirPods connected: {}", airpods.name);
         let attached = connect_airpods(&state, &session, &airpods.address.to_string(), fresh).await;
         fresh = false;
+        let mut relink = false;
         if let Ok(playback) = attached {
             let fd = state.l2cap_connection.read().await.as_ref().map(|c| c.fd());
             let a2dp = state.a2dp.get().filter(|_| playback);
+            let check_alone = playback && state.multipoint_address.is_some() && checked.insert(airpods.address);
             tokio::select! {
-                Some(Err(e)) = OptionFuture::from(fd.map(|fd| recv_loop(&state, fd))) => warn!("L2CAP error: {}", e),
+                Some(end) = OptionFuture::from(fd.map(|fd| recv_loop(&state, fd, check_alone))) => match end {
+                    Ok(LinkEnd::Relink) => relink = true,
+                    Ok(LinkEnd::Closed) => info!("Control channel closed"),
+                    Err(e) => warn!("L2CAP error: {e}"),
+                },
                 Some(()) = OptionFuture::from(a2dp.map(|a2dp| a2dp.lost())) => info!("Playback stream closed"),
                 else => {}
             }
         }
         disconnect_airpods(&state).await;
+        if relink {
+            info!("Multipoint: worn, idle and alone for 6 s; reconnecting once");
+            match adapter.device(airpods.address) {
+                Ok(device) => {
+                    if let Err(e) = relink_once(&device).await {
+                        warn!("Multipoint reconnect ended: {e:#}");
+                    }
+                }
+                Err(e) => warn!("Multipoint device unavailable: {e}"),
+            }
+            // The new link goes through normal discovery. Do not force yet
+            // another disconnect just to select our preferred codec.
+            continue;
+        }
         match attached {
             Ok(_) => sleep(RETRY_DELAY).await,
             // Try again when they next connect, not in a loop.
@@ -557,6 +623,16 @@ async fn follow(state: Arc<DaemonState>, session: Session, adapter: bluer::Adapt
             }
         }
     }
+}
+
+async fn relink_once(device: &bluer::Device) -> Result<()> {
+    anyhow::ensure!(device.is_connected().await?, "device already left");
+    bluez::disconnect_device(device).await?;
+    sleep(Duration::from_secs(1)).await;
+    if !device.is_connected().await? {
+        bluez::connect_device(device).await?;
+    }
+    Ok(())
 }
 
 /// Ask BlueZ to connect the first paired AirPods in range.
